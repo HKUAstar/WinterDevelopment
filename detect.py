@@ -4,6 +4,7 @@
 HKU-Astar
 '''
 
+import time
 import torch
 import argparse
 import cv2 as cv
@@ -19,17 +20,21 @@ from geometry_msgs.msg import Vector3
 IMG_W = 1280
 IMG_H = 720
 PITCH_OFFSET = 0.025 # for raising the head
-MAX_YAW = 0.06
+MAX_YAW = 0.070
 MAX_PITCH = 0.03
-YAW_RANGE = 150
+MIN_YAW = 0.005
+MIN_PITCH = 0.005
+YAW_RANGE_1 = 150 # velocity mode
+YAW_RANGE_2 = 150 # acceleration mode
 PITCH_RANGE = 100
-MAX_YAW_ACC = 0.080
-MIN_YAW_ACC = 0.025
-MAX_PITCH_ACC = 0.025
+MAX_YAW_ACC = 0.110
+MIN_YAW_ACC = 0.040
+MAX_PITCH_ACC = 0.035
 MIN_PITCH_ACC = 0.010
 TARGET_ZONE = 8 # radius in pixels
 MIN_TARGET_AREA = 666
 TARGET_AREA_EPS = 100
+MODE_EPS = 3
 ### Hyperparameters ###
 
 ### Shooting ###
@@ -37,8 +42,8 @@ parser = argparse.ArgumentParser(description='Auto-aiming Mode')
 parser.add_argument('--shoot', action='store_true', help='shoot')
 args = parser.parse_args()
 SHOOT = True
-SHOOT_X = IMG_W // 2 - 65
-SHOOT_Y = IMG_H // 2 + 100
+SHOOT_X = IMG_W // 2 - 55
+SHOOT_Y = IMG_H // 2 + 135
 ### Shooting ###
  
 class AutoAiming:
@@ -46,42 +51,57 @@ class AutoAiming:
         ros.init_node('auto_aiming')
         self.cv_bridge = CvBridge() # tool to convert cv2 images to ros image
 
-        self.predictor = PredictSpeed()
+        self.predictor_v = PredictSpeed()
+        self.predictor_a = PredictSpeed()
         self.detector = ArmorDetector()
         self.controller = Controller()
 
         self.img_pub = ros.Publisher('/annotated_image', Image, queue_size=10) # publish labeled image
         self.tar_pub = ros.Publisher('/target_coordinates', Vector3, queue_size=10) # publish coordinate of target in pixels
+        self.tar_pub = ros.Publisher('/auto_aiming_info', Vector3, queue_size=10) # publish coordinate of target in pixels
         ros.Subscriber('camera/color/image_raw', Image, self.callback) # get camera image
 
         self.last_act = [0, 0]
         self.last_tar = None # for target tracing, (x, y, name)
         self.last_tar_v = [0, 0]
 
+        self.x_on_target = False
+
+        self.foo = []
+
+        self.mode = 'acceleration'
+
         ros.spin() # start
 
     def callback(self, img):
+        time0 = time.time()
         img = np.frombuffer(img.data, dtype=np.uint8).reshape(img.height, img.width, -1)
-
+    
         res = self.detector.inference(img)
+
         tar, tar_bbox = self.pick_target(res)
         ros.loginfo('Target: ' + str(tar))
+
 
         if SHOOT and tar != None :
             self.shoot_target(tar, tar_bbox)
 
-        act, pred_tar, pred_tar_v = self.trace_target(tar, res)
-        self.publish_annotated_image(img, res, tar, pred_tar, act)
+        act, pred_tar, pred_tar_v = self.trace_target(tar, tar_bbox, res)
+        # self.publish_annotated_image(img, res, tar, pred_tar, act)
+
+        self.foo.append(time.time() - time0)
+        ros.loginfo('Time: ' + str(np.mean(self.foo)))
 
         self.last_tar = tar
         self.last_act = act
         self.last_tar_v = pred_tar_v
 
+
     def shoot_target(self, tar, tar_bbox):
         if SHOOT_X > tar_bbox[0] and SHOOT_X < tar_bbox[2] and SHOOT_Y > tar_bbox[1] and SHOOT_Y < tar_bbox[3]:
             self.controller.shoot(mode=1)
 
-    def trace_target(self, tar, labels=None):
+    def trace_target(self, tar, tar_bbox, labels=None):
         if tar == None:
             msg = Vector3()
             msg.x, msg.y, msg.z = -1, -1, -1
@@ -91,33 +111,60 @@ class AutoAiming:
         vx, vy = 0, 0 # predicted speed
         dx, dy = 0, 0 # action to be taken
         ax, ay = 0, 0 # acceleration
+        tar_ax, tar_ay = 0, 0
         cx, cy = SHOOT_X, SHOOT_Y # target of aiming
         pred_tar = tar[:] # predicted coordinate in image
 
-        if self.last_tar != None and tar[-1] == self.last_tar[-1]:
-            pred_tar[0], pred_tar[1], vx, vy = self.predictor.predict(tar[:2]) # Kalman Filter
+        ros.loginfo(f'Center: {cx}, Target: {tar_bbox[0]}-{tar_bbox[2]}')
+        if self.x_on_target == True and (cx - tar_bbox[2]) * self.last_act[0] < 0 and (cx - tar_bbox[0]) * self.last_act[0] < 0:
+            self.mode = 'velocity'
+            # self.mode = 'acceleration' # for testing
+        if self.x_on_target == True and (cx - tar_bbox[2]) * self.last_act[0] > 0 and (cx - tar_bbox[0]) * self.last_act[0] > 0:
+            self.mode = 'acceleration'
+        if cx >= tar_bbox[0] and cx <= tar_bbox[2]:
+            self.x_on_target = True
         else:
-            self.predictor.reset(tar[:2])
+            self.x_on_target = False
 
-        pred_tar[0] += int(vx * 30)
-        pred_tar[1] += int(vy * 30)
+        ros.loginfo('Mode: ' + self.mode)
 
-        if abs(pred_tar[0] - cx) > TARGET_ZONE:
-            ax = min((abs((pred_tar[0] - cx)) / YAW_RANGE), 1) * MAX_YAW_ACC
-            ax = max(ax, MIN_YAW_ACC)
-            if pred_tar[0] > cx: 
-                ax = -ax
+        if self.mode == 'acceleration':
+            if self.last_tar != None: # speed estimation
+                vx = tar[0] - self.last_tar[0]
+                vy = tar[1] - self.last_tar[1]
 
-        if abs(pred_tar[1] - cy) > TARGET_ZONE:
-            ay = min(abs((pred_tar[1] - cy) / PITCH_RANGE), 1) * MAX_PITCH_ACC
-            ay = max(ay, MIN_PITCH_ACC)
-            if pred_tar[1] > cy: 
-                ay = -ay
+            pred_tar[0] += int(vx * 40) # default:35
+            pred_tar[1] += int(vy * 40)
 
-        dx = min(self.last_act[0] + ax * 0.015, MAX_YAW)
-        dy = min(self.last_act[1] - ay * 0.015, MAX_PITCH)
+            if abs(pred_tar[0] - cx) > TARGET_ZONE:
+                ax = min((abs((pred_tar[0] - cx)) / YAW_RANGE_2) ** (6), 1) * MAX_YAW_ACC
+                ax = max(ax, MIN_YAW_ACC)
+                if pred_tar[0] > cx: 
+                    ax = -ax
 
-        self.controller.move(dx, dy, PITCH_OFFSET, log=True)
+            if abs(pred_tar[1] - cy) > TARGET_ZONE:
+                ay = min(abs((pred_tar[1] - cy) / PITCH_RANGE) ** (6), 1) * MAX_PITCH_ACC
+                ay = max(ay, MIN_PITCH_ACC)
+                if pred_tar[1] > cy: 
+                    ay = -ay
+
+            dx = min(self.last_act[0] + ax * 0.025, MAX_YAW)  # - tar_ax * 0.001, MAX_YAW)
+            dy = min(self.last_act[1] + ay * 0.025, MAX_PITCH)
+
+        if self.mode == 'velocity':
+            if abs(tar[0] - cx) > TARGET_ZONE:
+                dx = min((abs((tar[0] - cx)) / YAW_RANGE_1), 1) * MAX_YAW
+                dx = max(dx, MIN_YAW)
+                if tar[0] > cx: 
+                    dx = -dx
+
+            if abs(tar[1] - cy) > TARGET_ZONE:
+                dy = min(abs((tar[1] - cy) / PITCH_RANGE), 1) * MAX_PITCH
+                dy = max(dy, MIN_PITCH)
+                if tar[1] > cy: 
+                    dy = -dy
+
+        self.controller.move(dx, -dy, PITCH_OFFSET, log=True)
 
         msg = Vector3()
         msg.x, msg.y, msg.z = tar[0], tar[1], dx
